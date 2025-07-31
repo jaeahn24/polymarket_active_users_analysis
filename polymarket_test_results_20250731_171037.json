@@ -1,0 +1,38 @@
+{
+  "total_active_users": 408,
+  "profitable_users_count": 5,
+  "profitable_users_details": [
+    {
+      "address": "0x51373c6b56e4a38bf97c301efbff840fc8451556",
+      "profit": 5181.339404787171,
+      "trade_count": 36,
+      "display_name": "Ziigmund"
+    },
+    {
+      "address": "0xefe6520783a28b726c9c492ee13ada80ca011a7d",
+      "profit": 2372.7385745747015,
+      "trade_count": 20,
+      "display_name": "YesGambleYesCrypto"
+    },
+    {
+      "address": "0x9e5c74c0bf46f0bf3fcd1064d17e6201c67fd8e6",
+      "profit": 2621.698977900224,
+      "trade_count": 16,
+      "display_name": "sportbet"
+    },
+    {
+      "address": "0x35c0732e069faea97c11aa9cab045562eaab81d6",
+      "profit": 1491.4529779364918,
+      "trade_count": 12,
+      "display_name": "Anonymous"
+    },
+    {
+      "address": "0xc631d9d610b9939f0b915b1916864e9b806876f6",
+      "profit": 2343.6681297293203,
+      "trade_count": 9,
+      "display_name": "EGH"
+    }
+  ],
+  "analysis_timestamp": "2025-07-31T17:10:37.828737",
+  "analysis_period_start": "2025-02-01T17:10:32"
+}
