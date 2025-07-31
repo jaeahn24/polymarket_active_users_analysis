@@ -4,8 +4,8 @@ from datetime import datetime, timedelta
 import json
 from collections import defaultdict
 
-class PolymarketAPI:
-    """API wrapper for Polymarket endpoints with correct field names"""
+class PolymarketRateLimitedScanner:
+    """Trade scanner with proper rate limiting and 429 error handling"""
     
     def __init__(self):
         self.base_url = "https://data-api.polymarket.com"
@@ -13,280 +13,302 @@ class PolymarketAPI:
         self.session.headers.update({
             'User-Agent': 'PolymarketAnalyzer/1.0'
         })
+        
+        # Rate limiting settings
+        self.base_delay = 0.5  # Start with 500ms between requests
+        self.current_delay = self.base_delay
+        self.max_delay = 10.0  # Max 10 seconds
+        self.backoff_multiplier = 2.0
+        self.success_delay_reduction = 0.9  # Reduce delay by 10% on success
+        
+        # Calculate 6 months ago timestamp
+        self.six_months_ago = int((datetime.now() - timedelta(days=180)).timestamp())
+        print(f"Scanning for users active since: {datetime.fromtimestamp(self.six_months_ago)}")
+        print(f"Starting with {self.base_delay}s delay between requests")
     
-    def test_connection(self):
-        """Test if we can connect to the API"""
-        try:
-            response = self.session.get(
-                f"{self.base_url}/trades",
-                params={'limit': 1},
-                timeout=10
-            )
-            
-            if response.status_code == 200:
-                data = response.json()
-                print(f"✅ API Connection successful!")
-                print(f"   Status: {response.status_code}")
-                print(f"   Response contains {len(data)} trades")
+    def make_request_with_backoff(self, url, params, max_retries=5):
+        """
+        Make API request with exponential backoff for rate limiting
+        """
+        for attempt in range(max_retries):
+            try:
+                response = self.session.get(url, params=params, timeout=30)
                 
-                if data:
-                    sample_trade = data[0]
-                    print(f"   Sample trade keys: {list(sample_trade.keys())}")
+                if response.status_code == 200:
+                    # Success - gradually reduce delay
+                    self.current_delay = max(
+                        self.base_delay, 
+                        self.current_delay * self.success_delay_reduction
+                    )
+                    return response
+                
+                elif response.status_code == 429:
+                    # Rate limited - increase delay
+                    retry_after = response.headers.get('Retry-After')
+                    if retry_after:
+                        wait_time = int(retry_after)
+                        print(f"   🕐 Rate limited. Retry-After: {wait_time}s")
+                    else:
+                        wait_time = self.current_delay * self.backoff_multiplier
+                        self.current_delay = min(self.max_delay, wait_time)
+                        print(f"   🕐 Rate limited. Backing off to {self.current_delay:.1f}s delay")
                     
-                    # Check for user address field
-                    proxy_wallet = sample_trade.get('proxyWallet')
-                    if proxy_wallet:
-                        print(f"   Found user address field: proxyWallet = {proxy_wallet[:10]}...")
+                    if attempt < max_retries - 1:
+                        print(f"   ⏳ Waiting {wait_time:.1f}s before retry {attempt + 1}/{max_retries}")
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        print(f"   ❌ Max retries reached for rate limiting")
+                        return None
                 
-                return True
-            else:
-                print(f"❌ API Connection failed! Status: {response.status_code}")
-                return False
-                
-        except Exception as e:
-            print(f"❌ Connection error: {e}")
-            return False
+                else:
+                    print(f"   ❌ API Error: HTTP {response.status_code}")
+                    if attempt < max_retries - 1:
+                        print(f"   🔄 Retrying in {self.current_delay:.1f}s...")
+                        time.sleep(self.current_delay)
+                        continue
+                    else:
+                        return None
+                        
+            except Exception as e:
+                print(f"   ❌ Request error: {e}")
+                if attempt < max_retries - 1:
+                    print(f"   🔄 Retrying in {self.current_delay:.1f}s...")
+                    time.sleep(self.current_delay)
+                    continue
+                else:
+                    return None
+        
+        return None
     
-    def fetch_trades_page(self, limit=100, offset=0, taker_only=True, user=None):
+    def scan_all_recent_trades_with_rate_limiting(self):
         """
-        Fetch a single page of trades from the API
-        
-        Args:
-            limit: Number of trades to fetch (max 500)
-            offset: Starting index for pagination  
-            taker_only: If True, only return taker orders (default True per API)
-            user: Optional user address to filter trades
-        
-        Returns:
-            List of trades or None if error
+        Scan ALL trades with proper rate limiting
         """
-        try:
-            # Build parameters according to API docs
-            params = {
-                'limit': min(limit, 500),  # API max is 500
-                'offset': offset,
-                'takerOnly': str(taker_only).lower()  # API expects string boolean
-            }
+        print(f"\n=== Rate-Limited Trade Scanning ===")
+        print(f"Will handle rate limits gracefully with exponential backoff")
+        
+        # Storage
+        active_users = set()
+        user_trade_counts = defaultdict(int)
+        user_names = {}
+        
+        # Progress tracking
+        offset = 0
+        limit = 500
+        total_api_calls = 0
+        successful_calls = 0
+        failed_calls = 0
+        total_trades_processed = 0
+        recent_trades_found = 0
+        consecutive_old_trades = 0
+        rate_limit_hits = 0
+        
+        start_time = time.time()
+        
+        while True:
+            total_api_calls += 1
             
-            # Add user filter if provided
-            if user:
-                params['user'] = user
+            # Progress updates every 10 successful calls
+            if successful_calls % 10 == 0 and successful_calls > 0:
+                elapsed = time.time() - start_time
+                rate = successful_calls / elapsed if elapsed > 0 else 0
+                
+                print(f"\n📊 Progress Update:")
+                print(f"   Time elapsed: {elapsed/60:.1f} minutes")
+                print(f"   Successful API calls: {successful_calls:,}")
+                print(f"   Failed calls: {failed_calls}")
+                print(f"   Rate limit hits: {rate_limit_hits}")
+                print(f"   Current delay: {self.current_delay:.2f}s")
+                print(f"   Success rate: {rate:.1f} calls/sec")
+                print(f"   Trades processed: {total_trades_processed:,}")
+                print(f"   Unique users: {len(active_users):,}")
             
-            print(f"Fetching trades: limit={limit}, offset={offset}, takerOnly={taker_only}")
-            if user:
-                print(f"  Filtering for user: {user[:10]}...{user[-6:]}")
-            
-            response = self.session.get(
+            # Make the API request
+            response = self.make_request_with_backoff(
                 f"{self.base_url}/trades",
-                params=params,
-                timeout=30
+                {
+                    'limit': limit,
+                    'offset': offset,
+                    'takerOnly': 'false'
+                }
             )
             
-            if response.status_code == 200:
+            if response is None:
+                failed_calls += 1
+                print(f"❌ Failed to get response after retries")
+                
+                # If we get too many failures, stop
+                if failed_calls >= 5:
+                    print(f"❌ Too many failures ({failed_calls}). Stopping scan.")
+                    break
+                    
+                # Skip this batch and continue
+                offset += limit
+                continue
+            
+            # Track rate limiting
+            if response.status_code == 429:
+                rate_limit_hits += 1
+            
+            successful_calls += 1
+            
+            try:
                 trades = response.json()
-                print(f"✅ Successfully fetched {len(trades)} trades")
-                return trades
-            else:
-                print(f"❌ API Error: HTTP {response.status_code}")
-                print(f"   Response: {response.text[:200]}")
-                return None
                 
-        except requests.RequestException as e:
-            print(f"❌ Network error: {e}")
-            return None
-        except Exception as e:
-            print(f"❌ Unexpected error: {e}")
-            return None
-
-def analyze_trade_structure(trades):
-    """Analyze the structure of trade data"""
-    if not trades:
-        print("No trades to analyze")
-        return
-    
-    print(f"\n=== Analyzing Trade Data Structure ===")
-    print(f"Total trades received: {len(trades)}")
-    
-    # Look at the first trade
-    sample_trade = trades[0]
-    print(f"\nSample trade keys: {list(sample_trade.keys())}")
-    
-    # Print key fields from sample trade - using CORRECT field names
-    print(f"\nKey trade data:")
-    important_fields = ['timestamp', 'proxyWallet', 'price', 'size', 'side', 'conditionId', 'title']
-    for field in important_fields:
-        value = sample_trade.get(field, 'NOT FOUND')
-        print(f"  {field}: {value}")
-    
-    # Check timestamp format and convert to readable date
-    if 'timestamp' in sample_trade:
-        ts = sample_trade['timestamp']
-        print(f"  timestamp as date: {datetime.fromtimestamp(ts)}")
-    
-    # Show what fields are available for user identification
-    user_fields = ['proxyWallet', 'name', 'pseudonym']
-    print(f"\nUser identification fields:")
-    for field in user_fields:
-        value = sample_trade.get(field, 'NOT FOUND')
-        print(f"  {field}: {value}")
-
-def extract_user_addresses(trades):
-    """Extract unique user addresses from trades using correct field name"""
-    user_addresses = set()
-    trade_counts = defaultdict(int)
-    user_names = {}  # Store user names for reference
-    
-    print(f"\n=== Extracting User Addresses ===")
-    
-    for trade in trades:
-        # Extract addresses using CORRECT field name
-        proxy_wallet = trade.get('proxyWallet')  # This is the correct field!
-        user_name = trade.get('name', '')
-        pseudonym = trade.get('pseudonym', '')
-        
-        if proxy_wallet:
-            user_addresses.add(proxy_wallet)
-            trade_counts[proxy_wallet] += 1
-            
-            # Store user display info
-            if proxy_wallet not in user_names:
-                display_name = user_name or pseudonym or 'Anonymous'
-                user_names[proxy_wallet] = display_name
-    
-    print(f"Found {len(user_addresses)} unique user addresses")
-    
-    # Show top active users
-    top_users = sorted(trade_counts.items(), key=lambda x: x[1], reverse=True)[:5]
-    print(f"\nTop 5 most active users in this sample:")
-    for i, (address, count) in enumerate(top_users, 1):
-        display_name = user_names.get(address, 'Unknown')
-        print(f"  {i}. {address[:10]}...{address[-6:]} ({display_name}) - {count} trades")
-    
-    return user_addresses, trade_counts, user_names
-
-def filter_trades_by_time(trades, cutoff_timestamp):
-    """Filter trades to only include those after cutoff timestamp"""
-    if not trades:
-        return []
-    
-    recent_trades = []
-    old_trades = 0
-    
-    for trade in trades:
-        trade_timestamp = trade.get('timestamp', 0)
-        
-        if trade_timestamp >= cutoff_timestamp:
-            recent_trades.append(trade)
-        else:
-            old_trades += 1
-    
-    print(f"\nTime filtering results:")
-    print(f"  Recent trades (last 6 months): {len(recent_trades)}")
-    print(f"  Older trades: {old_trades}")
-    
-    if recent_trades:
-        oldest_recent = min(trade.get('timestamp', 0) for trade in recent_trades)
-        newest_recent = max(trade.get('timestamp', 0) for trade in recent_trades)
-        print(f"  Date range of recent trades:")
-        print(f"    From: {datetime.fromtimestamp(oldest_recent)}")
-        print(f"    To: {datetime.fromtimestamp(newest_recent)}")
-    
-    return recent_trades
-
-def analyze_trade_volume(trades):
-    """Analyze trading volume from the trades"""
-    if not trades:
-        return
-    
-    print(f"\n=== Trade Volume Analysis ===")
-    
-    total_volume = 0
-    buy_volume = 0
-    sell_volume = 0
-    buy_count = 0
-    sell_count = 0
-    
-    for trade in trades:
-        size = trade.get('size', 0)
-        price = trade.get('price', 0)
-        side = trade.get('side', '')
-        
-        try:
-            trade_value = float(size) * float(price)
-            total_volume += trade_value
-            
-            if side == 'BUY':
-                buy_volume += trade_value
-                buy_count += 1
-            elif side == 'SELL':
-                sell_volume += trade_value
-                sell_count += 1
+                if not trades:
+                    print(f"📭 No more trades available")
+                    break
                 
-        except (ValueError, TypeError):
-            continue
-    
-    print(f"Total volume: ${total_volume:.2f}")
-    print(f"Buy volume: ${buy_volume:.2f} ({buy_count} trades)")
-    print(f"Sell volume: ${sell_volume:.2f} ({sell_count} trades)")
+                # Process trades
+                batch_recent = 0
+                batch_old = 0
+                
+                for trade in trades:
+                    total_trades_processed += 1
+                    trade_timestamp = trade.get('timestamp', 0)
+                    
+                    if trade_timestamp >= self.six_months_ago:
+                        batch_recent += 1
+                        recent_trades_found += 1
+                        consecutive_old_trades = 0
+                        
+                        proxy_wallet = trade.get('proxyWallet')
+                        if proxy_wallet:
+                            active_users.add(proxy_wallet)
+                            user_trade_counts[proxy_wallet] += 1
+                            
+                            if proxy_wallet not in user_names:
+                                name = trade.get('name', '') or trade.get('pseudonym', '') or 'Anonymous'
+                                user_names[proxy_wallet] = name
+                    else:
+                        batch_old += 1
+                        consecutive_old_trades += 1
+                
+                # Stop if too many old trades
+                if consecutive_old_trades >= 2500:
+                    print(f"🛑 Stopping: Found {consecutive_old_trades} consecutive old trades")
+                    break
+                
+                # Move to next batch
+                offset += limit
+                
+                # Rate limiting delay (always wait between requests)
+                time.sleep(self.current_delay)
+                
+            except json.JSONDecodeError:
+                print(f"❌ Invalid JSON response")
+                failed_calls += 1
+                continue
+            except Exception as e:
+                print(f"❌ Error processing response: {e}")
+                failed_calls += 1
+                continue
+        
+        # Final results
+        total_time = time.time() - start_time
+        
+        print(f"\n" + "="*50)
+        print(f"RATE-LIMITED SCAN COMPLETE")
+        print(f"="*50)
+        print(f"Total time: {total_time/60:.1f} minutes")
+        print(f"Successful API calls: {successful_calls:,}")
+        print(f"Failed calls: {failed_calls}")
+        print(f"Rate limit hits: {rate_limit_hits}")
+        print(f"Average delay used: {self.current_delay:.2f}s")
+        print(f"Trades processed: {total_trades_processed:,}")
+        print(f"Recent trades: {recent_trades_found:,}")
+        print(f"✅ UNIQUE ACTIVE USERS: {len(active_users):,}")
+        print(f"="*50)
+        
+        return active_users, user_trade_counts, user_names
 
-def test_fixed_chunk2():
-    """Test the fixed API calls with correct field names"""
-    print("=== Testing Chunk 2 (Fixed): Correct Field Names ===\n")
+def test_rate_limited_scanning():
+    """Test the rate-limited scanning approach"""
+    print("=== Testing Rate-Limited Trade Scanning ===")
+    print("This version handles HTTP 429 errors gracefully")
     
-    # Setup
-    api = PolymarketAPI()
-    six_months_ago = int((datetime.now() - timedelta(days=180)).timestamp())
-    print(f"Looking for trades since: {datetime.fromtimestamp(six_months_ago)}")
+    scanner = PolymarketRateLimitedScanner()
     
-    # Test 1: Basic connection
-    print("\nTest 1: API Connection")
-    if not api.test_connection():
-        print("❌ Cannot proceed without API connection")
-        return
+    print(f"\nRate limiting strategy:")
+    print(f"• Start with {scanner.base_delay}s delay between requests")
+    print(f"• Exponential backoff on 429 errors")
+    print(f"• Gradual reduction on successful requests")
+    print(f"• Max delay: {scanner.max_delay}s")
     
-    # Test 2: Fetch trades with correct parameters
-    print("\nTest 2: Fetch trades with corrected parameters")
-    trades = api.fetch_trades_page(limit=20, offset=0, taker_only=False)  # Get both maker and taker
+    print("\nThis will take longer but avoid rate limiting issues.")
+    print("Expected time: 30-60 minutes")
     
-    if not trades:
-        print("❌ Failed to fetch trades")
-        return
+    confirm = input("\nProceed with rate-limited scan? (y/N): ")
+    if confirm.lower() != 'y':
+        print("Cancelled.")
+        return None, None, None
     
-    # Test 3: Analyze structure with correct field names
-    print("\nTest 3: Analyze trade structure")
-    analyze_trade_structure(trades)
+    # Run rate-limited scan
+    users, counts, names = scanner.scan_all_recent_trades_with_rate_limiting()
     
-    # Test 4: Extract user addresses using CORRECT field name
-    print("\nTest 4: Extract user addresses (using proxyWallet)")
-    user_addresses, trade_counts, user_names = extract_user_addresses(trades)
+    if users:
+        print(f"\n🏆 TOP 10 MOST ACTIVE USERS:")
+        sorted_users = sorted(counts.items(), key=lambda x: x[1], reverse=True)
+        for i, (address, count) in enumerate(sorted_users[:10], 1):
+            name = names.get(address, 'Anonymous')
+            print(f"   {i:2d}. {address[:10]}...{address[-6:]} ({name}) - {count} trades")
     
-    # Test 5: Filter by time
-    print("\nTest 5: Filter trades by time (6 months)")
-    recent_trades = filter_trades_by_time(trades, six_months_ago)
+    return users, counts, names
+
+# Quick test function for finding optimal delay
+def test_rate_limits():
+    """Quick test to find optimal rate limiting"""
+    print("=== Testing Rate Limits ===")
     
-    # Test 6: Analyze volume
-    print("\nTest 6: Analyze trade volume")
-    analyze_trade_volume(trades)
+    delays = [0.2, 0.5, 1.0, 2.0]  # Test different delays
     
-    # Test 7: Test user-specific trade fetching
-    if user_addresses:
-        test_user = list(user_addresses)[0]
-        test_user_name = user_names.get(test_user, 'Unknown')
-        print(f"\nTest 7: Fetch trades for specific user")
-        print(f"Testing with: {test_user[:10]}... ({test_user_name})")
-        user_trades = api.fetch_trades_page(limit=10, user=test_user)
-        if user_trades:
-            print(f"  ✅ Found {len(user_trades)} trades for this user")
+    for delay in delays:
+        print(f"\nTesting {delay}s delay...")
+        
+        session = requests.Session()
+        session.headers.update({'User-Agent': 'PolymarketAnalyzer/1.0'})
+        
+        success_count = 0
+        rate_limit_count = 0
+        
+        for i in range(10):  # Test 10 requests
+            try:
+                response = session.get(
+                    "https://data-api.polymarket.com/trades",
+                    params={'limit': 10, 'offset': i * 10},
+                    timeout=10
+                )
+                
+                if response.status_code == 200:
+                    success_count += 1
+                elif response.status_code == 429:
+                    rate_limit_count += 1
+                    print(f"   Rate limited on request {i+1}")
+                
+                time.sleep(delay)
+                
+            except Exception as e:
+                print(f"   Error on request {i+1}: {e}")
+        
+        print(f"   Results: {success_count}/10 successful, {rate_limit_count} rate limited")
+        
+        if rate_limit_count == 0:
+            print(f"   ✅ {delay}s delay works!")
+            break
         else:
-            print(f"  ℹ️  No trades found for this user")
-    
-    print(f"\n✅ Chunk 2 (Fixed) completed successfully!")
-    print(f"   API parameters and field names verified")
-    print(f"   Fetched {len(trades)} trades")
-    print(f"   Found {len(user_addresses)} unique users")
-    print(f"   {len(recent_trades)} trades from last 6 months")
-    
-    return api, trades, user_addresses, trade_counts, recent_trades
+            print(f"   ❌ {delay}s delay still hits rate limits")
 
 if __name__ == "__main__":
-    results = test_fixed_chunk2()
+    print("Choose option:")
+    print("1. Test rate limits to find optimal delay")
+    print("2. Run full rate-limited scan")
+    
+    choice = input("Enter choice (1-2): ")
+    
+    if choice == "1":
+        test_rate_limits()
+    elif choice == "2":
+        active_users, trade_counts, user_names = test_rate_limited_scanning()
+    else:
+        print("Invalid choice")
